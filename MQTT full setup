@@ -1,0 +1,212 @@
+#include <ESP8266WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
+
+// ---------------- WIFI ----------------
+#define WIFI_SSID "Vishnu"
+#define WIFI_PASSWORD ""
+
+// ---------------- MQTT ----------------
+#define MQTT_BROKER "178068b248dd4f68be453ad948e5ea0b.s1.eu.hivemq.cloud"
+#define MQTT_PORT 8883
+#define MQTT_USERNAME "witty"
+#define MQTT_PASSWORD "Vishnu@123"
+
+// ---------------- IDENTIFIERS ----------------
+#define API_KEY "4a26377f2a7488d764fa1ab4a1be668df140310b166082a1e635e6d743f2502c"
+#define CROP_ID "69da0651a20e4f3ea03339e7"
+
+// ---------------- TOPICS ----------------
+String pubTopic = String(API_KEY) + "/iot/data";
+String subTopic = String(CROP_ID) + "/motor/control";
+
+// ---------------- PINS ----------------
+#define WIFI_LED D4   // 🔥 Built-in LED (WiFi status)
+#define MOTOR_LED D5  // 🔥 External LED (motor)
+
+// ---------------- GLOBALS ----------------
+WiFiClientSecure espClient;
+PubSubClient client(espClient);
+
+bool motorOn = false;
+unsigned long lastRetry = 0;
+unsigned long lastSend = 0;
+
+// 🔁 Retry buffer
+String lastPayload = "";
+bool hasPending = false;
+
+// ---------------- WIFI ----------------
+void setup_wifi() {
+  Serial.print("Connecting WiFi...");
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  unsigned long lastBlink = 0;
+  bool ledState = false;
+
+  while (WiFi.status() != WL_CONNECTED) {
+
+    // 🔁 Blink built-in LED (inverted logic)
+    if (millis() - lastBlink > 300) {
+      lastBlink = millis();
+      ledState = !ledState;
+      digitalWrite(WIFI_LED, ledState ? LOW : HIGH);
+    }
+
+    delay(10);
+    Serial.print(".");
+  }
+
+  Serial.println("\n✅ WiFi Connected");
+
+  // ✅ Always ON after connection
+  digitalWrite(WIFI_LED, LOW);
+}
+
+// ---------------- MQTT CALLBACK ----------------
+void callback(char* topic, byte* payload, unsigned int length) {
+
+  Serial.println("\n📩 MQTT Message Received");
+
+  StaticJsonDocument<200> doc;
+
+  DeserializationError error = deserializeJson(doc, payload, length);
+
+  if (error) {
+    Serial.print("❌ JSON Parse Failed: ");
+    Serial.println(error.c_str());
+    return;
+  }
+
+  bool irrigation = doc["irrigation"];
+
+  motorOn = irrigation;
+
+  Serial.print("💡 Motor State: ");
+  Serial.println(motorOn ? "ON" : "OFF");
+}
+
+// ---------------- MQTT CONNECT ----------------
+void reconnect() {
+  Serial.print("🔄 MQTT...");
+
+  if (client.connect("ESP8266Client", MQTT_USERNAME, MQTT_PASSWORD)) {
+    Serial.println("✅ Connected");
+
+    client.subscribe(subTopic.c_str(), 1);
+    Serial.println("📡 Subscribed: " + subTopic);
+
+  } else {
+    Serial.print("❌ Failed rc=");
+    Serial.println(client.state());
+  }
+}
+
+// ---------------- SENSOR ----------------
+int getSoil() {
+  int value = analogRead(A0);
+  return value - 250;
+}
+
+int getTemp() { return 27; }
+int getHum()  { return 65; }
+
+// ---------------- MQTT SEND ----------------
+void sendSensorData(int soil, int temp, int hum) {
+
+  StaticJsonDocument<200> doc;
+
+  doc["cropId"] = CROP_ID;
+  doc["SoilMoisture"] = soil;
+  doc["temperature"] = temp;
+  doc["Humidity"] = hum;
+
+  String json;
+  serializeJson(doc, json);
+
+  Serial.println("\n📤 Publishing MQTT...");
+  Serial.println(json);
+
+  if (client.publish(pubTopic.c_str(), json.c_str())) {
+    Serial.println("✅ Sent");
+    hasPending = false;
+  } else {
+    Serial.println("❌ Failed → storing for retry");
+    lastPayload = json;
+    hasPending = true;
+  }
+}
+
+// ---------------- SETUP ----------------
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(WIFI_LED, OUTPUT);
+  pinMode(MOTOR_LED, OUTPUT);
+
+  // Turn OFF initially
+  digitalWrite(WIFI_LED, HIGH);
+  digitalWrite(MOTOR_LED, LOW);
+
+  setup_wifi();
+
+  espClient.setInsecure();
+
+  client.setServer(MQTT_BROKER, MQTT_PORT);
+  client.setCallback(callback);
+
+  reconnect();
+}
+
+// ---------------- LOOP ----------------
+void loop() {
+
+  // 🔁 MQTT handling
+  if (client.connected()) {
+    client.loop();
+  } else {
+    if (millis() - lastRetry > 5000) {
+      lastRetry = millis();
+      reconnect();
+    }
+  }
+
+  // 🔁 WiFi reconnect
+  if (WiFi.status() != WL_CONNECTED) {
+    setup_wifi();
+  }
+
+  // 🔁 Retry pending message
+  if (hasPending && client.connected()) {
+    Serial.println("🔁 Retrying last message...");
+
+    if (client.publish(pubTopic.c_str(), lastPayload.c_str())) {
+      Serial.println("✅ Retry Success");
+      hasPending = false;
+    } else {
+      Serial.println("❌ Retry Failed");
+    }
+  }
+
+  // 💡 Motor LED control (NORMAL LED, not inverted)
+  digitalWrite(MOTOR_LED, motorOn ? HIGH : LOW);
+
+  // 📊 Read sensor
+  int soil = getSoil();
+  int temp = getTemp();
+  int hum  = getHum();
+
+  Serial.println("\n📊 DATA");
+  Serial.print("🌱 Soil: "); Serial.println(soil);
+  Serial.print("🌡️ Temp: "); Serial.println(temp);
+  Serial.print("💧 Humidity: "); Serial.println(hum);
+
+  // 📡 Send every 10 sec
+  if (millis() - lastSend > 10000) {
+    sendSensorData(soil, temp, hum);
+    lastSend = millis();
+  }
+
+  delay(1000);
+}
